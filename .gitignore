@@ -1,4 +1,59 @@
+# Node modules
 node_modules/
+
+# Build outputs
 dist/
-cookies.json
-*.csv
+*.js
+*.js.map
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Yarn
+.pnp.*
+.yarn/*
+!.yarn/releases
+!.yarn/plugins
+!.yarn/patches
+!.yarn/releases
+!.yarn/versions
+.yarnrc.yml
+
+# Environment files
+.env
+
+# Playwright user data
+user-data/
+user-data2/
+
+# Playwright browser install cache
+install-state.gz
+
+# Crawler outputs
+output.csv
+output.tsv
+output.json
+output.xml
+output.xlsx
+
+# VS Code settings
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE/editor temp files
+*.swp
+*.swo
+
+
+# Misc dirs
+auth-profile/
+storage/
+auth-state.json
+src/response.txt

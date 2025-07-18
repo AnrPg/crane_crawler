@@ -1,40 +1,14 @@
 
-/**
- * crane_crawler.ts
- *
- * A web scraper for Immersive Chinese (https://console.immersivechinese.com/) that:
- * 1. Automates Google login via Playwright (user intervenes only to complete 2FA).
- * 2. Crawls every “Lesson” in the Serial Course list.
- * 3. Extracts each phrase’s pinyin, simplified Chinese, translation, notes, audio-fast & audio-slow URLs.
- * 4. Assembles all rows into a CSV via danfojs-node.
- *
- * Uses:
- * • crawlee v2’s PlaywrightCrawler for dynamic navigation and rate-limiting.
- * • danfojs-node for DataFrame aggregation & CSV export.
- * • got-scraping for lightweight fetch of raw HTML (alternative to Playwright for static pages).
- * • simplecrawler (commented out) as an alternative for pure HTTP crawling.
- *
- * Installation:
- *   yarn add crawlee playwright danfojs-node got-scraping simplecrawler
- *
- * Usage:
- *   npx ts-node crane_crawler.ts --output output.csv
- *
- * Intuition:
- * • PlaywrightCrawler gives us headful browsing so we can handle Google OAuth flows.
- * • We pause for the human to finish Google login only once, then reuse the same session for all lesson pages.
- * • We collect data into an array of objects, then DataFrame for easy CSV.
- * • got-scraping could be swapped in for faster static HTML fetch if Google cookies are saved.
- */
-
-import { PlaywrightCrawler, RequestQueue, Router, log } from 'crawlee';
-import * as dfd from 'danfojs-node';
+import { PlaywrightCrawler, RequestQueue, log, Request } from 'crawlee';
+import type { Page, ElementHandle } from 'playwright';
 import * as fs from 'fs';
-import got from 'got-scraping';
-// import * as Crawler from 'simplecrawler'; // Alternative: pure HTTP crawler, but OAuth makes it tricky
+import path from 'path';
+import ExcelJS from 'exceljs';
 
 interface PhraseRow {
-  lesson: string;
+  lessonTitle: string;
+  lessonNum: number;
+  slideIndex: number;
   pinyin: string;
   chinese: string;
   translation: string;
@@ -43,101 +17,186 @@ interface PhraseRow {
   audioSlow: string;
 }
 
+const lessonOrder = new Map<string, number>();
+let nextOrder = 1;
+
+function getLessonOrder(lessonTitle: string): number {
+  if (!lessonOrder.has(lessonTitle)) {
+    lessonOrder.set(lessonTitle, nextOrder++);
+  }
+  return lessonOrder.get(lessonTitle)!;
+}
+
+function escapeXml(str: string): string {
+  return str.replace(/[<>&'"\\]/g, c => ({
+    '<': '&lt;',
+    '>': '&gt;',
+    '&': '&amp;',
+    '"': '&quot;',
+    "'": '&apos;'
+  }[c] as string));
+}
+
+
 async function main() {
-  // 1️⃣ Create a queue to manage lesson-list and lesson-detail URLs
-  const requestQueue = await RequestQueue.open();
-
-  // 2️⃣ Launch a PlaywrightCrawler to handle dynamic login + scraping
-  const crawler = new PlaywrightCrawler({
-    launchContext: { headless: false }, // headful to allow Google login
-    async preNavigation({ page, enqueueLinks }) {
-      // Once at root, intercept login via Google
-      if (page.url().includes('console.immersivechinese.com/login')) {
-        log.info('➡️ Please click "Login with Google" and finish auth, then press ENTER in console');
-        await waitForKeypress();
-      }
-    },
-    requestHandler: async ({ page, request, enqueueLinks, log }) => {
-      const url = request.url;
-      log.info(`🔍 Crawling ${url}`);
-
-      if (url.endsWith('/serial-course')) {
-        // 1st page: list of lessons
-        // Enqueue each lesson list-group-item
-        const lessonLinks = await page.$$eval('#list-tab a.list-group-item', els => els.map(a => (a as HTMLAnchorElement).href));
-        for (const link of lessonLinks) {
-          await requestQueue.addRequest({ url: link, userData: { label: 'lesson-page' } });
-        }
-      }
-      else if (request.userData.label === 'lesson-page') {
-        // Detail page: loop through each phrase slider
-        const lessonTitle = await page.$eval('.serial_course_title div', el => el.textContent.trim());
-        const slides = await page.$$('[id^=main_slide-]');
-        for (const slide of slides) {
-          const pinyin = await slide.$eval('tr.pinyin .show_pinyin_text', el => el.textContent.trim());
-          const chinese = await slide.$eval('tr.chinese_characters .show_simplified_characters_text', el => el.textContent.trim());
-          const translation = await slide.$eval('tr.english .show_translation_characters_text', el => el.textContent.trim());
-          // notes may be missing
-          const notes = await slide.$$eval('.parent_lesson_note .lesson_note_div', els => els.length ? els[0].textContent.trim() : '');
-          const audioFast = await slide.evaluate(el => el.getAttribute('data-audio-fast'));
-          const audioSlow = await slide.evaluate(el => el.getAttribute('data-audio-slow'));
-          rows.push({ lesson: lessonTitle, pinyin, chinese, translation, notes, audioFast, audioSlow });
-        }
-      }
-    },
-    // Optional: handle errors
-    failedRequestHandler: async ({ request }) => {
-      log.error(`❌ Request ${request.url} failed too many times`);
-    }
-  });
-
-  // 3️⃣ Start by enqueuing the serial-course root URL
-  await requestQueue.addRequest({ url: 'https://console.immersivechinese.com/serial-course', userData: { label: 'root' } });
+  log.info('🔧 Starting main()');
 
   const rows: PhraseRow[] = [];
+  log.info('Rows array initialized');
 
-  // Run the crawler
-  await crawler.run();
+  const requestQueue = await RequestQueue.open();
+  log.info('RequestQueue opened');
 
-  // 4️⃣ After crawling: build DataFrame & write CSV
-  const df = new dfd.DataFrame(rows);
-  // Clean undesirable symbols: remove extra whitespace, curly HTML entities
-  df['pinyin'] = df['pinyin'].str.replace(/\s+/g, ' ');
+  const userDataDir = path.resolve(__dirname, '../user-data');
+  log.info(`Using userDataDir: ${userDataDir}`);
 
-  // Save CSV
-  const csv = await df.toCSV({ header: true });
-  fs.writeFileSync('output.csv', csv, { encoding: 'utf8' });
-  console.log('✅ CSV written to output.csv');
-}
+  const crawler = new PlaywrightCrawler({
+    requestQueue,
+    launchContext: {
+      launchOptions: {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      },
+      userDataDir,
+    },
+    preNavigationHooks: [
+      async ({ page }: { page: Page }) => {
+        log.info(`preNavigationHooks: at URL ${page.url()}`);
+        if (page.url().includes('/login')) {
+          log.info('➡️ Detected login page; performing login');
 
-// Helper: wait for user key press in console
-function waitForKeypress(): Promise<void> {
-  return new Promise(resolve => {
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.once('data', () => {
-      process.stdin.setRawMode(false);
-      resolve();
-    });
+          // Minimal Changes Start Here: Email+Password Login Logic
+          const EMAIL = 'aivc24014@uniwa.gr'; // Replace with your email
+          const PASSWORD = 'tpeoC!!!12';       // Replace with your password
+
+          // Filling the email and password fields based on HTML provided
+          await page.waitForSelector('input[name="email"]', { timeout: 30000 });
+          await page.type('input[name="email"]', EMAIL, { delay: 50 });
+
+          await page.waitForSelector('input[name="password"]', { timeout: 30000 });
+          await page.type('input[name="password"]', PASSWORD, { delay: 50 });
+
+          // Click the login button
+          await page.click('button[type="submit"]');
+
+          // Wait for navigation after login
+          await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 });
+          log.info('✅ Logged in successfully via email+password');
+        }
+      },
+    ],
+    requestHandler: async ({ page, request }: { page: Page; request: Request }) => {
+      log.info(`🔍 requestHandler start for ${request.url}`);
+
+      if (request.userData.label === 'root') {
+        log.info('→ Handling HOME/SERIAL-COURSE list page');
+        await page.waitForSelector('a.open_lesson');
+        const lessonLinks = await page.$$eval(
+          'a.open_lesson',
+          (els: Element[]) => els.map((a) => (a as HTMLAnchorElement).href)
+        );
+
+        for (const link of lessonLinks) {
+          await requestQueue.addRequest({
+            url: link,
+            userData: { label: 'lesson-page' },
+          });
+        }
+
+      } else if (request.userData.label === 'lesson-page') {
+        const lessonTitle = await page.$eval(
+          '.serial_course_title',
+          (el: Element) => el.textContent!.trim()
+        );
+        const lessonOrderNum = getLessonOrder(lessonTitle);
+
+        const slides = (await page.$$('[id^=main_slide-]')) as ElementHandle<Element>[];
+
+        for (let idx = 0; idx < slides.length; idx++) {
+          const slideHandle = slides[idx];
+          const slideIndex = idx + 1;
+
+          const pinyin = await slideHandle.$eval(
+            'tr.pinyin .show_pinyin_text',
+            (el: Element) => el.textContent?.trim().replace(/,/g, '') ?? ''
+          );
+          const chinese = await slideHandle.$eval(
+            'tr.chinese_characters .show_simplified_characters_text',
+            (el: Element) => el.textContent?.trim().replace(/,/g, '') ?? ''
+          );
+          const translation = await slideHandle.$eval(
+            'tr.english .show_translation_characters_text',
+            (el: Element) => el.textContent?.trim().replace(/,/g, '') ?? ''
+          );
+          const notes = (
+            await slideHandle.$$eval(
+              '.parent_lesson_note .lesson_note_div',
+              (els: Element[]) => (els[0]?.textContent || '').trim().replace(/,/g, '')
+            )
+          ) || '';
+
+          const audioFast = (await slideHandle.getAttribute('data-audio-fast')) || '';
+          const audioSlow = (await slideHandle.getAttribute('data-audio-slow')) || '';
+
+          rows.push({ lessonTitle, lessonNum: lessonOrderNum, slideIndex, pinyin, chinese, translation, notes, audioFast, audioSlow });
+        }
+      }
+    },
+    failedRequestHandler: async ({ request }) => {
+      log.error(`❌ Request ${request.url} failed too many times`);
+    },
   });
+
+  await requestQueue.addRequest({
+    url: 'https://console.immersivechinese.com/',
+    userData: { label: 'root' },
+  });
+
+  log.info('🏃 Starting crawler.run()');
+  await crawler.run();
+log.info('🏁 crawler.run() finished');
+
+  if (rows.length === 0) return;
+
+  rows.sort((a, b) => a.lessonNum - b.lessonNum || a.slideIndex - b.slideIndex);
+  const headers = Object.keys(rows[0]) as Array<keyof PhraseRow>;
+
+  // CSV
+  const csvLines = [headers.join(','), ...rows.map(r =>
+    headers.map(h => `"${String(r[h]).replace(/"/g, '""')}"`).join(',')
+  )];
+  fs.writeFileSync('output.csv', csvLines.join('\n'), 'utf8');
+  log.info(`✅ CSV written to output.csv (${rows.length} rows)`);
+
+  // TSV
+  const tsvLines = [headers.join('\t'), ...rows.map(r =>
+    headers.map(h => `"${String(r[h]).replace(/"/g, '""')}"`).join('\t')
+  )];
+  fs.writeFileSync('output.tsv', tsvLines.join('\n'), 'utf8');
+  log.info(`✅ TSV written to output.tsv (${rows.length} rows)`);
+
+  // JSON
+  fs.writeFileSync('output.json', JSON.stringify(rows, null, 2), 'utf8');
+  log.info(`✅ JSON written to output.json (${rows.length} rows)`);
+
+  // XML
+  const xmlItems = rows.map(r => {
+    const fields = headers.map(h => `<${h}>${escapeXml(String(r[h]))}</${h}>`).join('');
+    return `<row>${fields}</row>`;
+  });
+  fs.writeFileSync('output.xml', `<?xml version="1.0"?><rows>${xmlItems.join('')}</rows>`, 'utf8');
+  log.info(`✅ XML written to output.xml (${rows.length} rows)`);
+
+  // Excel
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Data');
+  sheet.addRow(headers);
+  rows.forEach(r => sheet.addRow(Object.values(r)));
+  await workbook.xlsx.writeFile('output.xlsx');
+  log.info(`✅ XLSX written to output.xlsx (${rows.length} rows)`);
 }
 
-// Kick off
 main().catch(err => {
-  console.error(err);
+  log.error('Fatal error in main()', err);
   process.exit(1);
 });
-
-/**
- * Alternative approaches:
- *
- * 1) Use crawlee.CheerioCrawler + got-scraping:
- *    - Save cookies from a manual Playwright login, then reload them into got-scraping.
- *    - Faster headless runs as no browser engine.
- *
- * 2) Use simplecrawler (commented) for pure HTTP:
- *    - E.g.:
- *      const c = new Crawler('https://console.immersivechinese.com/serial-course');
- *      c.on('fetchcomplete', ... )
- *    - But handling OAuth & JS-driven UI is much more complex.
- */
