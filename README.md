@@ -147,7 +147,8 @@ This project is [ISC](https://opensource.org/licenses/ISC)-licensed. Feel free t
 
 > *“Immersive Chinese is the best website I have found so far for learning Chinese without a teacher.”*
 
-
+**The scraped data are not included in the commits here to comply with Copyright regulations related to the site's premium (paid) content. Use the script at your own descretion/risk!**
+Actually, to download the premium content, one should have an active, paid subscription.
 ---
 
 ## 🚀 Author
