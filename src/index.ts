@@ -143,7 +143,7 @@ async function main() {
       }
     },
     failedRequestHandler: async ({ request }) => {
-      log.error(`❌ Request ${request.url} failed too many times`);
+      log.error(`❌ Request ${request.url} failed too many times!`);
     },
   });
 

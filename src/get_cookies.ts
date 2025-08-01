@@ -82,7 +82,3 @@ async function getCookies() {
 }
 
 getCookies().catch(console.error);
-
-
-// "regas,apn@gmail.com"
-// "tpeoC!!!12"
